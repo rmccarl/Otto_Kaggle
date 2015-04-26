@@ -1,0 +1,320 @@
+
+
+##DRAFT    
+
+###Otto Group Classification Competition (Public Kaggle)
+
+![](C:\Users\Robert\Documents\RProjects\Otto_Kaggle\Ottosnip.png)
+
+**GOAL: The purpose of the draft is to describe my current approach taken with respect to the Otto Group competition. The competition specifics can be found at http://www.kaggle.com/c/otto-group-product-classification-challenge**
+
+
+###**Current Results**
+  
+Three models have been utilized to benchmark and iteratively improve the Kaggle multi-class logloss score. Gradient boosting (GBM) was used initially due to publicized success in past data science competitions and also to test the model performance under the R ‘caret’ package. The model proved to be a heavy consumer of computing resources and there was some instability with respect to runtime behavior.  Repeated cross-validation of the training data often resulted in runtime issues leading to the related execution being halted. This may have been due to the addition of a custom cost function to extend supported error reporting.  
+  
+A random forest model (RF) was tested after the initial GBM results were obtained. The confusion matrix produced by the RF model shows likely clustering issues with some of the classes provided in the data. This is consistent with univariate procedures performed prior to model execution. The multi-class logloss value was close to the GBM model and runtime behavior is stable. The last model tested was an extreme gradient boosting model (XGB) wrapped in an R package ‘xgboost’. This model produced the best results of the three tested and was used as a candidate for further study. 
+  
+**Current score is top 25% with more than a month left before the competition concludes.**
+
+**The GBM and Random Forest models resulted in cost function values of approximately 0.57. The current model being employed is an extreme gradient boosting model which results in a multiclass log loss error of 0.47.**
+
+**Next Steps: **    
+**- Review whether the extreme boosting mechanism actually uses stratified sampling as the class distributions are skewed**  
+**- Feature engineering with respect to possible interactions**
+
+
+A point to consider in the competition in general is at what level of difference are the scores statistically significant? There appears to be a lot of clustering between .40 - .45. Unclear if some of this is due to randomness at the moment.  
+
+
+####Document Structure
+  
+First, the basic univariate examination of the data is discussed. A description of the various models used and their results are presented afterwards. Specific comments related to each step are interspersed throughout the text. 
+
+
+```{r initBlock, echo=FALSE, warning=FALSE, message=FALSE}
+###Variable Mining 
+options(scipen=100)
+library(devtools)
+library(ggplot2)
+library(Rtsne)
+library(caret)
+library(gbm)
+library(randomForest)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(corrplot)
+library(scales)
+library(xgboost)
+library(Matrix)
+library(methods)
+
+library(doParallel) 
+library(ape)
+library(xtable)
+
+
+datMy <- read.csv("train.csv", header = TRUE)
+datMyTest <- read.csv("test.csv", header = TRUE)
+```
+
+
+####In the beginning - Univariate analysis
+
+The steps below perform an initial correlation check, plot relative feature frequency and relative feature level range. 
+
+1) Correlation check - visual to detect any really serious correlation. There are other approaches but first take a quick overview of the feature set. There is neither any dark blue nor any deep red other than on the diagonal. 
+
+```{r, echo=FALSE,eval=TRUE}
+
+#The word "univariate" oftens appears in the beginning of these data science undertakings. Univariate is a  #bit like "January" on the calendar. Its associated with cold, gray swatches of plots not yet painted with #the colors of spring. 
+
+datMy.scale <- scale(datMy[,2:ncol(datMy)-1],center=TRUE,scale=TRUE)[,-1]
+corMatMy <- cor(datMy.scale)
+highlyCor <- findCorrelation(corMatMy, 0.5)
+datMyFiltered.scale <- datMy.scale[,-highlyCor]
+corMatMy <- cor(datMyFiltered.scale)
+corrplot(corMatMy, order = "hclust", tl.pos = "n")
+rm(datMy.scale)
+rm(datMyFiltered.scale)
+
+```
+
+  
+  
+2) Plot by class both the relative frequency for every feature and the number of levels of each feature. If there are particular features that are highly prevalent, these plots should uncover them. The number of levels takes into account that this is sparse data. There may be some features that are not highly prevalent but nevertheless may have a large variance. 
+
+The two example plots below illustrate the reasoning. Class 5 should likely be easier to cluster as it depicts a large frequency at a particular feature. 
+
+```{r uniplot, eval=TRUE, echo=FALSE, message=FALSE}
+##Get each column sum, and create a percentage table of events
+classList <- unlist(lapply(c(2,5), function(x) paste0("Class_", x)))
+
+printFeatureEvents <- function (datMy, classname) {
+  eventCnt <- subset(group_by(datMy, target) %>% summarise_each(funs(sum(.))),,-2)
+  eventPer <- sweep(eventCnt[,-c(1)], 1, rowSums(eventCnt[,-c(1)]), "/")
+  eventPer = cbind(eventCnt[,1], eventPer)
+  dataAll = melt(eventPer, id = 1)
+  datapts <- dataAll[dataAll$target==classname,]
+
+  minval = min(datapts[datapts$value > quantile(datapts$value,prob=0.95),]$value)
+  datapts <- mutate(datapts, top5 = ifelse(value > minval, TRUE, FALSE ))
+  datapts$showRow <- ifelse(datapts$top5 == TRUE, " ", " ")
+
+  p = ggplot(data=datapts, aes(x = seq(1,nrow(datapts)), y = value, fill=factor(top5)))
+  p = p + geom_bar(stat = "identity") 
+  p = p + labs(title = paste0(classname, " - % of All Events by Feature"), x = "Feature Number", y = "% of Class Events")
+  p = p + scale_x_continuous(breaks=seq(0,93,5)) + scale_y_continuous(labels=percent)
+  p = p + scale_fill_discrete(name="Top 5%")
+  p 
+}
+
+printFeatureLevels <- function (datMy, classname) {
+  eventCnt <- subset(group_by(datMy, target) %>% summarise_each(funs(n_distinct(.))), ,-2)
+  dataAll = melt(eventCnt, id = 1)
+  datapts <- dataAll[dataAll$target==classname,]
+  ylimit = max(datapts$value)
+  
+  minval = min(datapts[datapts$value > quantile(datapts$value,prob=0.95),]$value)
+  datapts <- mutate(datapts, top5 = ifelse(value > minval, TRUE, FALSE ))
+  datapts$showRow <- ifelse(datapts$top5 == TRUE, " ", " ")
+
+  p = ggplot(data=datapts, aes(x = seq(1,nrow(datapts)), y = value, fill=factor(top5))) + geom_bar(stat = "identity")
+  p = p + labs(title = paste0(classname, " - Distinct Levels by Feature"), x = "Feature Number", y = "Distinct Levels") 
+  p = p + scale_x_continuous(breaks=seq(0,93,5)) + scale_y_continuous(limits=c(0,ylimit))
+  p = p + scale_fill_discrete(name="Top 5%")
+  p
+}
+
+
+lapply(classList, function (x) printFeatureEvents(datMy, x))
+lapply(classList, function (x) printFeatureLevels(datMy, x))
+```
+
+3) Check if particular classes can be clustered by the number of levels in each feature using the information produced in the charts above. Due to the sparse nature of the data, we should not initially expect too much info from the mean/median.
+
+
+```{r Dendos, eval=TRUE, echo=FALSE, message=FALSE}
+
+par(mfrow=c(1,1))
+
+eventCnt <- subset(group_by(datMy, target) %>% summarise_each(funs(sum(.))),,-2)
+eventPer <- sweep(eventCnt[,-c(1)], 1, rowSums(eventCnt[,-c(1)]), "/")
+hc = hclust(dist(eventPer))
+plot(as.dendrogram(hc), ylab="Relative Distance", xlab="Class", main="Class Cluster by # of Features")
+
+eventCnt <- subset(group_by(datMy, target) %>% summarise_each(funs(n_distinct(.))), ,-2)
+hc = hclust(dist(eventCnt[,-1]))
+plot(as.dendrogram(hc), ylab="Relative Distance", xlab="Class", main="Class Cluster by # of Unique Feature Levels")
+```
+
+
+Prior charts appear to show Classes 2, 3 and 4 to be close in characteristics. The chart below confirms they are indeed close in features.  
+
+  
+  
+  
+```{r xtable, results='asis', eval=TRUE, echo=FALSE,message=FALSE,warning=FALSE}
+datMy3 = datMy
+ind = datMy3 > 0
+datMy3[ind] = 1
+datMy3$numFeat <- rowSums(datMy3[,names(datMy3) != "target"])
+res = ddply(datMy3, .(target), function(x) summary(x$numFeat))[2:4,c(5,7)]
+row.names(res) <- c("Class_2", "Class_3", "Class_4")
+print(xtable(res, align = "lrr", caption="Mean and Max # of Features for Items in Class Indicated"), caption.placement = "top", type="html")
+rm(datMy3)
+
+```
+    
+    
+    
+    
+    
+    
+  
+  
+  
+
+```{r scatter,eval=FALSE, echo=FALSE, cache=TRUE}
+set.seed(500)
+test <- filter(datMy, target %in% c("Class_1","Class_2","Class_3","Class_4")) %>% select(2:95)
+tsne_out_train <- Rtsne(as.matrix(test[,-94]), check_duplicates = FALSE, pca = TRUE, perplexity=30, theta=0.5)
+testp = c("red", "blue", "green", "orange")
+palette(testp)
+
+plot(tsne_out_train$Y, col=as.factor(test$target), pch=".", cex=4, axes=FALSE, xlab="", ylab="", main="Scatter Plot - Classes 1,2,3,4,7")
+legend("bottomleft", c("1","2","3","4"),  lty=c(1,1), lwd=c(5,5), col=testp, bty="n", cex = 0.7) 
+palette("default")
+```
+  
+  
+    
+    
+####Model choices - beyond the beginning
+
+With information from the initial univariate analysis above, it's now possible to start the modeling stage. As mentioned earlier, a GBM model was utilized initially. My understanding is GBM may not be particularly suited for sparse matrix work. However, since some well-known Kaggler suggested it has won its share of competitions, let's see how it works here.
+
+The plan will be to first benchmark on GBM and examine the model implications with respect to our earlier data analysis. Second, we will test two more models to see if our results are significantly impacted. Our second and third choices will be random forests and then extreme boosting. One of the reasons for the last choice is I want to observe how xgboost fares when compared to GBM in a sparse data environment. We can always benchmark other models as time permits.
+
+The Kaggle competition uses multiclass logloss as the model selection metric (smaller the better). Since the R caret package interface does not support multiclass logloss natively, I created a custom error handler and extended the R implementation of GBM with my own function. As a result, output from the 'gbm' package below displays "mcLogLoss" and not the expected "accuracy" metric.
+
+1) **GBM** - Example results from the gbm model are shown below with the first table using a learning rate of 0.1. The second assumes a learning rate of 0.01. The tuning process shows the learning rate to be a large factor in traiing error assessment. However, runtime stability made the conclusion difficult as repeated cross-validation often failed. As a secondary test, the top 20 most important features were extracted and the model was rerun, but the change in inputs did not improve the error.
+
+  
+```{r, eval=TRUE, echo=FALSE}
+
+in_train = createDataPartition(datMy$target, p=0.80, list=FALSE)
+trIdx = datMy[in_train, ]
+tsIdx = datMy[-in_train, ]
+```
+
+``````{r gbmblock, eval=FALSE, echo=FALSE}
+
+mcLogLoss <- function (data,
+                       lev = NULL,
+                       model = NULL) {
+  
+  if (!all(levels(data[, "pred"]) == levels(data[, "obs"]))) 
+    stop("levels of observed and predicted data do not match")
+  
+  LogLoss <- function(actual, pred, err=1e-15) {
+    pred[pred < err] <- err
+    pred[pred > 1 - err] <- 1 - err
+    -1/nrow(actual)*(sum(actual*log(pred)))
+  }
+  
+  dtest <- dummyVars(~obs, data=data, levelsOnly=TRUE)
+  actualClasses <- predict(dtest, data[,-1])
+  
+  out <- LogLoss(actualClasses, data[,-c(1:2)])  
+  names(out) <- "mcLogLoss"
+  out
+}
+
+gbmGrid <- expand.grid(.shrinkage = 0.1, .n.trees = c(100), .interaction.depth = c(10))
+
+fitControl <- trainControl(method="repeatedcv",
+                           number=5,
+                           repeats=1,
+                           verboseIter=TRUE,
+                           summaryFunction = mcLogLoss,
+                           classProbs=TRUE)
+
+set.seed(10)
+gbmTest4 <- train(as.factor(target) ~ ., data=trIdx[,-c(1)], method="gbm",
+                 trControl=fitControl,
+                 distribution="multinomial",
+                 tuneGrid=gbmGrid,
+                 metric="mcLogLoss",
+                 maximize=FALSE,
+                 verbose=FALSE)
+```
+
+  
+  
+  GBM WITH LEARNING RATE OF 0.1
+```{r rangbm, eval=TRUE, echo=FALSE}
+plot(gbmTest2) 
+
+```
+
+  
+  GBM WITH LEARNING RATE OF 0.01
+```{r rangbm2, eval=TRUE, echo=FALSE}
+plot(gbmTest3)
+```
+
+
+```{r eval=FALSE, echo=FALSE}
+varImp <- summary(gbmFit)
+varImp <- varImp[varImp$rel.inf >= 2.0,]
+eqn <- as.formula(paste("as.factor(target) ~ ", paste(varImp$var, sep = '', collapse = '+')))
+```
+
+
+2) **Random Forest** - Example results from random forest tuning at this point suggested a feature selection number of 8 and 200 trees. More tuning can certainly be done but at this stage, however, I wanted to get an approximate idea of model performance. The accuracy shown below coincides with a logloss of 0.58 which is about the same as the GBM model. What is interesting to note is the confusion matrix highlights something determined earlier in unvariate analysis. It appears the Positive Predictive Value of Classes 1, 3, 4 and Class 7 is not good at all. A large number of items identified in these classes are being assigned to different categories.
+
+
+```{r eval=FALSE, echo=FALSE, cache=TRUE}
+rf = randomForest(target ~., data = trIdx[,-1], ntree=200, mtry = 8,do.trace=5, importance = TRUE)
+```
+
+```{r eval=TRUE, echo=FALSE}
+rf
+```
+   
+   
+  
+3) **Extreme Gradient Boosting (XGB)** - This model outperformed the prior two by a wide margin. The cost function was approximately 0.47 which is a substantial improvement over any prior attempts and the runtime stability was excellent. Model training resulted in parameter values of 6 and 0.3 for tree depth and learning rate. The code stub below was used to call the R xgboost package. It is unclear if the xgboost cross-validation is based on a stratified sampling set. The nine class distributions provided in the dataset are not well balanced and this is something that should be clarified. Also, the feature set was extended by two level interactions for the top 20 variables (and also the bottom 20 variables) in order to examine changes in the cost function. There was no appreciable gain from the second level interactions added at this point.
+  
+
+```{r eval=FALSE, echo=TRUE, cache=TRUE}
+trIdx = datMy[, -1]
+tsIdx = datMyTest[, -1]
+
+dtrIdx = as(as.matrix(trIdx[,names(trIdx) != 'target']), "dgCMatrix")
+dtsIdx = as(as.matrix(tsIdx[,names(tsIdx) != 'target']), "dgCMatrix")
+
+outcomes = as.integer(gsub('Class_','',trIdx[,ncol(trIdx)])) - 1
+xdtrain <- xgb.DMatrix(data = dtrIdx, label = outcomes)
+
+cvIn <- list("num_class" = 9, "nthread" = 4, "eval_metric" = "mlogloss", verbose=FALSE)
+res.cvIn = xgb.cv(cvIn, xdtrain, nrounds=150, nfold = 4, objective='multi:softprob')
+bst <- xgboost(params = cvIn, data=xdtrain, nround=150, objective = 'multi:softprob', verbose=FALSE)
+
+```
+
+```{r eval=FALSE, echo=FALSE, cache=FALSE}
+pred = predict(bst, dtsIdx)
+pred = t(matrix(pred,9,length(pred)/9))
+pred <- formatC(pred, digits=3)
+pred <- format(pred, scientific=FALSE)
+pred = data.frame(seq(1,nrow(pred)),pred)
+
+classList <- unlist(lapply(1:9, function(x) paste0("Class_", x)))
+names(pred) <- c('id', classList)
+
+write.csv(pred, file = "submit.csv", row.names = FALSE, quote=FALSE)
+```
+
